@@ -2,172 +2,134 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 
-# ===================================
-# Custom CNN Architecture
-# ===================================
-class PotatoCNN(nn.Module):
-    """
-    Custom CNN for 3-class potato leaf disease classification.
-    Input: (B, 3, 128, 128)
-
-    Architecture:
-      Block 1: Conv(3->32)   -> BN -> ReLU -> Conv(32->32)  -> BN -> ReLU -> MaxPool -> Dropout
-      Block 2: Conv(32->64)  -> BN -> ReLU -> Conv(64->64)  -> BN -> ReLU -> MaxPool -> Dropout
-      Block 3: Conv(64->128) -> BN -> ReLU -> Conv(128->128)-> BN -> ReLU -> MaxPool -> Dropout
-      Block 4: Conv(128->256)-> BN -> ReLU -> Conv(256->256)-> BN -> ReLU -> AdaptiveAvgPool
-      Classifier: FC(256->128) -> ReLU -> Dropout -> FC(128->num_classes)
-    """
-
-    def __init__(self, num_classes: int = 3):
-        super(PotatoCNN, self).__init__()
-
-        def conv_block(in_ch, out_ch, pool=True, dropout=0.25):
-            layers = [
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            ]
-            if pool:
-                layers.append(nn.MaxPool2d(2, 2))   # halves spatial dims
-            if dropout > 0:
-                layers.append(nn.Dropout2d(dropout))
-            return nn.Sequential(*layers)
-
-        self.block1 = conv_block(3,   32,  pool=True, dropout=0.25)  # -> (32, 64, 64)
-        self.block2 = conv_block(32,  64,  pool=True, dropout=0.25)  # -> (64, 32, 32)
-        self.block3 = conv_block(64,  128, pool=True, dropout=0.25)  # -> (128, 16, 16)
-        self.block4 = conv_block(128, 256, pool=False, dropout=0.0)  # -> (256, 16, 16)
-
-        self.global_pool = nn.AdaptiveAvgPool2d(1)                   # -> (256, 1, 1)
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(128, num_classes),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.global_pool(x)
-        x = self.classifier(x)
-        return x
-
-
-# ===================================
-# Main Training Script
-# ===================================
 if __name__ == '__main__':
 
-    # -----------------------------------
-    # Device
-    # -----------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # -----------------------------------
-    # Transforms
-    # -----------------------------------
+    # ===================================
+    # Task 4: Augmentation Pipeline
+    # ===================================
+    MEAN = [0.485, 0.456, 0.406]
+    STD  = [0.229, 0.224, 0.225]
+
     train_transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(20),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        transforms.Resize((140, 140)),
+        transforms.RandomResizedCrop(size=128, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(degrees=30),
+        transforms.RandomPerspective(distortion_scale=0.3, p=0.4),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.08),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=MEAN, std=STD),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.0), value=0),
     ])
 
     val_transform = transforms.Compose([
         transforms.Resize((128, 128)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=MEAN, std=STD),
     ])
 
-    # -----------------------------------
-    # Datasets & DataLoaders
-    # -----------------------------------
+    # ===================================
+    # Datasets
+    # ===================================
     train_dataset = datasets.ImageFolder(root='data/train', transform=train_transform)
     val_dataset   = datasets.ImageFolder(root='data/val',   transform=val_transform)
+    NUM_CLASSES   = len(train_dataset.classes)
 
-    NUM_CLASSES = len(train_dataset.classes)
-    print("Classes:", train_dataset.classes)
-    print("Class-to-index:", train_dataset.class_to_idx)
-    print(f"Train: {len(train_dataset)} images | Val: {len(val_dataset)} images")
+    print("\nClasses     :", train_dataset.classes)
+    print("Class→index :", train_dataset.class_to_idx)
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=0)
+    # Class counts
+    class_counts = [0] * NUM_CLASSES
+    for _, label in train_dataset.samples:
+        class_counts[label] += 1
 
-    # -----------------------------------
-    # Model
-    # -----------------------------------
-    model = PotatoCNN(num_classes=NUM_CLASSES).to(device)
+    print("\nTraining images per class:")
+    for cls, cnt in zip(train_dataset.classes, class_counts):
+        print(f"  {cls:<15}: {cnt}")
 
-    # ── Pretty-print the full architecture ──────────────────────────────────
+    # ===================================
+    # WeightedRandomSampler (fixes class imbalance)
+    # ===================================
+    class_weights  = [1.0 / c for c in class_counts]
+    sample_weights = [class_weights[label] for _, label in train_dataset.samples]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=0)
+    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False,   num_workers=0)
+
+    # ===================================
+    # Weighted Loss (extra penalty for minority class)
+    # ===================================
+    total_samples = sum(class_counts)
+    loss_weights  = torch.tensor(
+        [total_samples / (NUM_CLASSES * c) for c in class_counts],
+        dtype=torch.float
+    ).to(device)
+
+    print("\nLoss weights:")
+    for cls, w in zip(train_dataset.classes, loss_weights.tolist()):
+        print(f"  {cls:<15}: {w:.4f}")
+
+    criterion = nn.CrossEntropyLoss(weight=loss_weights)
+
+    # ===================================
+    # Task 5: Transfer Learning — ResNet18
+    # ===================================
     print("\n" + "="*60)
-    print("         PotatoCNN — Model Architecture")
-    print("="*60)
-    print(model)
+    print("  Task 5 — Transfer Learning: ResNet18")
     print("="*60)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable    = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Total parameters     : {total_params:>10,}")
-    print(f"  Trainable parameters : {trainable:>10,}")
-    print(f"  Output classes       : {NUM_CLASSES}  →  {train_dataset.classes}")
-    print("="*60 + "\n")
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 
-    # -----------------------------------
-    # Loss & Optimizer
-    # -----------------------------------
-    # Equal weights; adjust e.g. [2.0, 1.0, 2.0] if classes are imbalanced
-    weights   = torch.ones(NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    # Freeze ALL base layers first
+    for param in model.parameters():
+        param.requires_grad = False
 
-    # -----------------------------------
+    # Replace final FC layer with our 3-class head
+    in_features  = model.fc.in_features          # 512 for ResNet18
+    model.fc     = nn.Sequential(
+        nn.Linear(in_features, 256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.4),
+        nn.Linear(256, NUM_CLASSES)
+    )
+    model = model.to(device)
+
+    total_params    = sum(p.numel() for p in model.parameters())
+    trainable_now   = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Pretrained backbone : ResNet18 (ImageNet weights)")
+    print(f"  Total parameters    : {total_params:,}")
+    print(f"  Trainable (Phase 1) : {trainable_now:,}  ← classifier head only")
+    print(f"  Frozen (Phase 1)    : {total_params - trainable_now:,}  ← ResNet18 backbone")
+    print(f"  Output classes      : {NUM_CLASSES} → {train_dataset.classes}")
+    print("="*60)
+
+    # ===================================
     # Tracking
-    # -----------------------------------
+    # ===================================
     train_losses   = []
     val_losses     = []
     val_accuracies = []
     best_val_loss  = float('inf')
 
-    # -----------------------------------
-    # Helper: one epoch
-    # -----------------------------------
     def run_epoch(loader, optimizer=None):
         training = optimizer is not None
         model.train() if training else model.eval()
-        total_loss = 0.0
-        correct = 0
-        total   = 0
-
+        total_loss = correct = total = 0
         ctx = torch.enable_grad() if training else torch.no_grad()
         with ctx:
             for images, labels in loader:
@@ -183,116 +145,159 @@ if __name__ == '__main__':
                 _, predicted = torch.max(outputs, 1)
                 total   += labels.size(0)
                 correct += (predicted == labels).sum().item()
-
         return total_loss / len(loader), 100.0 * correct / total
 
     # ===================================
-    # Phase 1: Warm-up — classifier head only (5 epochs)
-    # Trains only the FC layers; conv blocks stay frozen.
+    # Phase 1: Train classifier head only (7 epochs)
+    # Backbone frozen — ResNet18 features used as-is
     # ===================================
-    print("\n--- Phase 1: Warm-up classifier head (5 epochs) ---")
-    PHASE1_EPOCHS = 5
+    print("\n--- Phase 1: Classifier head only — backbone FROZEN (7 epochs) ---")
+    PHASE1_EPOCHS = 7
 
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.classifier.parameters():
-        param.requires_grad = True
-
-    optimizer1 = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3
-    )
+    optimizer1 = optim.Adam(model.fc.parameters(), lr=1e-3)
     scheduler1 = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer1, mode='min', patience=2, factor=0.5, verbose=True
-    )
+        optimizer1, mode='min', patience=2, factor=0.5, verbose=True)
 
     for epoch in range(PHASE1_EPOCHS):
-        tr_loss, _       = run_epoch(train_loader, optimizer1)
-        vl_loss, vl_acc  = run_epoch(val_loader)
-
+        tr_loss, _      = run_epoch(train_loader, optimizer1)
+        vl_loss, vl_acc = run_epoch(val_loader)
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
         val_accuracies.append(vl_acc)
         scheduler1.step(vl_loss)
-
         print(f"Epoch [{epoch+1:02d}/{PHASE1_EPOCHS}]  "
               f"Train Loss: {tr_loss:.4f}  |  "
               f"Val Loss: {vl_loss:.4f}  |  "
               f"Val Acc: {vl_acc:.2f}%")
-
         if vl_loss < best_val_loss:
             best_val_loss = vl_loss
             torch.save(model.state_dict(), "potato_model_best.pth")
             print("  -> Best model saved!")
 
     # ===================================
-    # Phase 2: Full fine-tune — all layers (15 epochs)
-    # Lower LR to avoid destroying early features.
+    # Phase 2: Unfreeze last ResNet block + train (10 epochs)
+    # Gradually unfreeze — avoids destroying pretrained features
     # ===================================
-    print("\n--- Phase 2: Full fine-tune all layers (15 epochs) ---")
-    PHASE2_EPOCHS = 15
+    print("\n--- Phase 2: Unfreeze layer4 + classifier (10 epochs) ---")
+    PHASE2_EPOCHS = 10
 
-    for param in model.parameters():
-        param.requires_grad = True
+    # Only unfreeze the last residual block (layer4) + fc
+    for name, param in model.named_parameters():
+        if 'layer4' in name or 'fc' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
-    optimizer2 = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    trainable_p2 = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Trainable parameters: {trainable_p2:,}  (layer4 + classifier)")
+
+    optimizer2 = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=5e-5, weight_decay=1e-4)
     scheduler2 = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer2, T_max=PHASE2_EPOCHS, eta_min=1e-6
-    )
+        optimizer2, T_max=PHASE2_EPOCHS, eta_min=1e-6)
 
     for epoch in range(PHASE2_EPOCHS):
-        tr_loss, _       = run_epoch(train_loader, optimizer2)
-        vl_loss, vl_acc  = run_epoch(val_loader)
-
+        tr_loss, _      = run_epoch(train_loader, optimizer2)
+        vl_loss, vl_acc = run_epoch(val_loader)
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
         val_accuracies.append(vl_acc)
         scheduler2.step()
-
         print(f"Epoch [{epoch+1:02d}/{PHASE2_EPOCHS}]  "
               f"Train Loss: {tr_loss:.4f}  |  "
               f"Val Loss: {vl_loss:.4f}  |  "
               f"Val Acc: {vl_acc:.2f}%  |  "
               f"LR: {scheduler2.get_last_lr()[0]:.2e}")
-
         if vl_loss < best_val_loss:
             best_val_loss = vl_loss
             torch.save(model.state_dict(), "potato_model_best.pth")
             print("  -> Best model saved!")
 
-    # -----------------------------------
-    # Final Metrics
-    # -----------------------------------
+    # ===================================
+    # Phase 3: Full fine-tune ALL layers (8 epochs)
+    # Very low LR to fine-tune without destroying ImageNet features
+    # ===================================
+    print("\n--- Phase 3: Full fine-tune ALL layers (8 epochs) ---")
+    PHASE3_EPOCHS = 8
+
+    for param in model.parameters():
+        param.requires_grad = True
+
+    trainable_p3 = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Trainable parameters: {trainable_p3:,}  (entire network)")
+
+    optimizer3 = optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    scheduler3 = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer3, T_max=PHASE3_EPOCHS, eta_min=1e-7)
+
+    for epoch in range(PHASE3_EPOCHS):
+        tr_loss, _      = run_epoch(train_loader, optimizer3)
+        vl_loss, vl_acc = run_epoch(val_loader)
+        train_losses.append(tr_loss)
+        val_losses.append(vl_loss)
+        val_accuracies.append(vl_acc)
+        scheduler3.step()
+        print(f"Epoch [{epoch+1:02d}/{PHASE3_EPOCHS}]  "
+              f"Train Loss: {tr_loss:.4f}  |  "
+              f"Val Loss: {vl_loss:.4f}  |  "
+              f"Val Acc: {vl_acc:.2f}%  |  "
+              f"LR: {scheduler3.get_last_lr()[0]:.2e}")
+        if vl_loss < best_val_loss:
+            best_val_loss = vl_loss
+            torch.save(model.state_dict(), "potato_model_best.pth")
+            print("  -> Best model saved!")
+
+    # ===================================
+    # Final per-class accuracy
+    # ===================================
     print(f"\nFinal Validation Accuracy : {val_accuracies[-1]:.2f}%")
     print(f"Best Validation Loss      : {best_val_loss:.4f}")
 
-    # -----------------------------------
+    model.load_state_dict(torch.load("potato_model_best.pth", map_location=device))
+    model.eval()
+    per_class = {i: {'c': 0, 't': 0} for i in range(NUM_CLASSES)}
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            _, preds = torch.max(model(images), 1)
+            for p, l in zip(preds, labels):
+                per_class[l.item()]['t'] += 1
+                if p == l:
+                    per_class[l.item()]['c'] += 1
+
+    print("\nPer-class accuracy (best model):")
+    for i, cls in enumerate(train_dataset.classes):
+        t  = per_class[i]['t']
+        cc = per_class[i]['c']
+        bar = '█' * int(30 * cc / t) + '░' * (30 - int(30 * cc / t))
+        print(f"  {cls:<15}: {bar}  {cc}/{t} = {100*cc/t if t>0 else 0:.1f}%")
+
+    # ===================================
     # Plot
-    # -----------------------------------
-    TOTAL_EPOCHS = PHASE1_EPOCHS + PHASE2_EPOCHS
+    # ===================================
+    TOTAL_EPOCHS = PHASE1_EPOCHS + PHASE2_EPOCHS + PHASE3_EPOCHS
     x = list(range(1, TOTAL_EPOCHS + 1))
 
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(14, 4))
 
     plt.subplot(1, 2, 1)
     plt.plot(x, train_losses, label='Train Loss')
     plt.plot(x, val_losses,   label='Val Loss')
-    plt.axvline(x=PHASE1_EPOCHS + 0.5, color='gray', linestyle='--', label='Full fine-tune start')
-    plt.title("Loss Curve")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
+    plt.axvline(x=PHASE1_EPOCHS + 0.5,                color='orange', linestyle='--', label='Unfreeze layer4')
+    plt.axvline(x=PHASE1_EPOCHS + PHASE2_EPOCHS + 0.5, color='red',   linestyle='--', label='Full fine-tune')
+    plt.title("Loss Curve"); plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend()
 
     plt.subplot(1, 2, 2)
     plt.plot(x, val_accuracies, color='green', label='Val Accuracy')
-    plt.axvline(x=PHASE1_EPOCHS + 0.5, color='gray', linestyle='--', label='Full fine-tune start')
-    plt.title("Validation Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy (%)")
-    plt.legend()
+    plt.axvline(x=PHASE1_EPOCHS + 0.5,                color='orange', linestyle='--', label='Unfreeze layer4')
+    plt.axvline(x=PHASE1_EPOCHS + PHASE2_EPOCHS + 0.5, color='red',   linestyle='--', label='Full fine-tune')
+    plt.title("Validation Accuracy"); plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)"); plt.legend()
 
     plt.tight_layout()
     plt.savefig("training_curves.png")
-    print("Training curves saved to training_curves.png")
+    print("\nTraining curves saved to training_curves.png")
 
     torch.save(model.state_dict(), "potato_model_final.pth")
     print("Final model saved to potato_model_final.pth")
